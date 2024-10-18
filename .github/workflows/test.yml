@@ -41,4 +41,4 @@ jobs:
         path: C:\\Users\\runneradmin\\.cache\\tinygrad\\downloads\
         key: downloads-cache-windows-only-${{ env.DOWNLOAD_CACHE_VERSION }}
     - name: Run windows test
-      run: python -m pytest test/ --ignore=test/external --ignore=test/models --ignore=test/unit --durations=20
+      run: set "GPU=1" & python -m pytest test/ --ignore=test/external --ignore=test/models --ignore=test/unit --durations=20
