@@ -373,7 +373,7 @@ jobs:
     - name: Install Dependencies
       run: pip install --user -e '.[testing]'
     - name: Run windows test
-      run: JIT=2 METAL=1 python -m pytest -n=auto test/ --ignore=test/external --ignore=test/models --ignore=test/unit --durations=20
+      run: JIT=2 python -m pytest -n=auto test/ --ignore=test/external --ignore=test/models --ignore=test/unit --durations=20
 
 #  testwebgl:
 #    name: WebGL Tests
