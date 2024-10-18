@@ -40,5 +40,11 @@ jobs:
       with:
         path: C:\\Users\\runneradmin\\.cache\\tinygrad\\downloads\
         key: downloads-cache-windows-only-${{ env.DOWNLOAD_CACHE_VERSION }}
+    - name: Add clang path to $PATH env
+      shell: bash
+      run: echo "PATH=$PATH:C:\msys64\mingw64\bin" >> $GITHUB_ENV
+    - name: Build clang (with ${{matrix.compiler}})
+      shell: bash
+      run: make CC=${{matrix.compiler}}
     - name: Run windows test
       run: set "GPU=1" & python -m pytest test/ --ignore=test/external --ignore=test/models --ignore=test/unit --durations=20
