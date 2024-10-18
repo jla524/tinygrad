@@ -252,6 +252,7 @@ def fetch(url:str, name:Optional[Union[pathlib.Path, str]]=None, subdir:Optional
         f.close()
         progress_bar.update(close=True)
         if length and (file_size:=os.stat(f.name).st_size) < length: raise RuntimeError(f"fetch size incomplete, {file_size} < {length}")
+        print(f"DEBUG: {fp=} {fp.is_file()=} {fp.exists()=}")
         pathlib.Path(f.name).rename(fp)
   return fp
 

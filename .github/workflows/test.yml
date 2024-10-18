@@ -39,6 +39,6 @@ jobs:
       uses: actions/cache@v4
       with:
         path: C:\\Users\\runneradmin\\.cache\\tinygrad\\downloads\
-        key: downloads-cache-metal-only-${{ env.DOWNLOAD_CACHE_VERSION }}
+        key: downloads-cache-windows-only-${{ env.DOWNLOAD_CACHE_VERSION }}
     - name: Run windows test
       run: python -m pytest -n=auto test/ --ignore=test/external --ignore=test/models --ignore=test/unit --durations=20
