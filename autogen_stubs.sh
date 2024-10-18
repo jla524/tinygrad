@@ -4,12 +4,12 @@
 if [[ ! $(clang2py -V) ]]; then
   pushd .
   cd /tmp
-  sudo apt-get install -y --no-install-recommends clang
+  #sudo apt-get install -y --no-install-recommends clang
   pip install --upgrade pip setuptools
   pip install clang==14.0.6
-  git clone https://github.com/nimlgen/ctypeslib.git
+  #git clone https://github.com/nimlgen/ctypeslib.git
   cd ctypeslib
-  pip install --user .
+  pip install .
   clang2py -V
   popd
 fi
