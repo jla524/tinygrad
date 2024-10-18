@@ -239,6 +239,7 @@ def fetch(url:str, name:Optional[Union[pathlib.Path, str]]=None, subdir:Optional
   else:
     fp = _ensure_downloads_dir() / (subdir or "") / \
       ((name or hashlib.md5(url.encode('utf-8')).hexdigest()) + (".gunzip" if gunzip else ""))
+  print(f"DEBUG: {fp=} {fp.is_file()=} {fp.exists()=}")
   if not fp.is_file() or not allow_caching:
     with urllib.request.urlopen(url, timeout=10) as r:
       assert r.status == 200
