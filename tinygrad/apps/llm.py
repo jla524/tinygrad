@@ -74,15 +74,13 @@ class SimpleTokenizer:
   def tools(self, tools:list|None) -> list[int]:
     if not tools: return []
     if self.preset == 'qwen2':
-      tool_text = "\n# Tools\n\nYou may call one or more functions to assist with the user query.\n"
-      tool_text += "You are provided with function descriptions in <tools></tools> XML tags:\n<tools>\n"
-      for t in tools:
-        f = t.get("function", {})
-        tool_text += f'<tool_description>\n<tool_name>{f.get("name", "")}</tool_name>\n<tool_description>{f.get("description", "")}</tool_description>\n'
-        if params := f.get("parameters"):
-          tool_text += f'<tool_parameters>{json.dumps(params)}</tool_parameters>\n'
-        tool_text += '</tool_description>\n'
-      tool_text += "</tools>\n"
+      # Qwen3 / Hermes tool prompt: list function *signatures* as JSON inside <tools>, ask for <tool_call>{json}</tool_call> back
+      tool_text = "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+      tool_text += "You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n"
+      for t in tools: tool_text += json.dumps(t) + "\n"
+      tool_text += "</tools>\n\n"
+      tool_text += "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
+      tool_text += "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>"
       return self.encode(tool_text)
     if self.preset in ('llama3', 'llama-v3', 'llama-bpe'):
       tool_text = "\n\nCutting Knowledge Date: December 2023\nToday Date: " + time.strftime("%d %b %Y") + "\n\n"
@@ -580,6 +578,17 @@ CHAT_HTML = b'''<!DOCTYPE html><html><head><title>tinygrad chat</title><style>
 
 def parse_tool_calls(text:str) -> list[dict]:
   calls = []
+  # Qwen3 / Hermes format: <tool_call>\n{"name": ..., "arguments": {...}}\n</tool_call>
+  for m in re.finditer(r'<tool_call>\s*(.*?)\s*</tool_call>', text, re.DOTALL):
+    try:
+      obj = json.loads(m.group(1))
+      if not isinstance(obj, dict) or "name" not in obj: continue
+      args = obj.get("arguments", {})
+      if isinstance(args, str): args = json.loads(args)
+      calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function", "function": {"name": obj["name"], "arguments": json.dumps(args)}})
+    except (json.JSONDecodeError, TypeError): pass
+  if calls: return calls
+  # fallback for models that emit bare JSON (llama3-style)
   for m in re.finditer(r'\{[^{}]*"name"\s*:\s*"([^"]+)"[^{}]*"arguments"\s*:\s*(\{[^{}]*\}|\{\})[^{}]*\}', text):
     try:
       args = json.loads(m.group(2)) if m.group(2) != '{}' else {}
@@ -591,6 +600,10 @@ class Handler(HTTPRequestHandler):
   _recent_completions: list[tuple[int, list[int]]] = []  # (ids_hash, out_tokens) rolling history
   _recent_max = 6
   def log_request(self, code='-', size='-'): pass
+  def handle_one_request(self):
+    # opencode closes keepalive sockets between requests; suppress the expected peer-disconnect noise
+    try: super().handle_one_request()
+    except (ConnectionResetError, BrokenPipeError): self.close_connection = True
   def do_GET(self):
     if self.path == "/v1/models": self.send_data(json.dumps({"object":"list","data":[{"id":model_name,"object":"model"}]}).encode())
     else: self.send_data(CHAT_HTML, content_type="text/html")
@@ -606,11 +619,32 @@ class Handler(HTTPRequestHandler):
     st = time.perf_counter()
     dec = tok.stream_decoder()
     ids_hash, recent = hash(tuple(ids)), list(Handler._recent_completions)
+    # strip <tool_call>...</tool_call> blocks from streamed content (they'll be surfaced as tool_calls at the end)
+    TC_OPEN, TC_CLOSE = "<tool_call>", "</tool_call>"
+    in_tc, hold = False, ""
     for next_id in model.generate(ids, temperature=temperature):
       if len(out) == 0: stderr_log(f"prefill:{(len(ids)-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
       if next_id in (eos_id, eot_id): break
       out.append(next_id)
-      yield {"choices": [{"index":0, "delta":{"content":dec(next_id)}, "finish_reason":None}], **tmpl}
+      hold += dec(next_id)
+      content = ""
+      while True:
+        if in_tc:
+          i = hold.find(TC_CLOSE)
+          if i == -1:
+            if len(hold) >= len(TC_CLOSE): hold = hold[-(len(TC_CLOSE)-1):]
+            break
+          hold, in_tc = hold[i+len(TC_CLOSE):], False
+        else:
+          i = hold.find(TC_OPEN)
+          if i == -1:
+            if len(hold) >= len(TC_OPEN):
+              content += hold[:-(len(TC_OPEN)-1)]
+              hold = hold[-(len(TC_OPEN)-1):]
+            break
+          content += hold[:i]
+          hold, in_tc = hold[i+len(TC_OPEN):], True
+      if content: yield {"choices": [{"index":0, "delta":{"content":content}, "finish_reason":None}], **tmpl}
       if max_tokens is not None and len(out) >= max_tokens:
         finish_reason = "length"
         break
@@ -619,7 +653,8 @@ class Handler(HTTPRequestHandler):
         stderr_log(f"{colored('loop detected, stopping', 'yellow')}  {colored('--', 'BLACK')}  ")
         break
     Handler._recent_completions = (Handler._recent_completions + [(ids_hash, out)])[-Handler._recent_max:]
-    if (tail := dec()): yield {"choices": [{"index":0, "delta":{"content":tail}, "finish_reason":None}], **tmpl}
+    hold += dec()
+    if not in_tc and hold: yield {"choices": [{"index":0, "delta":{"content":hold}, "finish_reason":None}], **tmpl}
     if tools and (calls := parse_tool_calls(tok.decode(out))):
       yield {"choices": [{"index":0, "delta":{"tool_calls":calls}, "finish_reason":None}], **tmpl}
       finish_reason = "tool_calls"
