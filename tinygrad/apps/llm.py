@@ -61,7 +61,7 @@ class SimpleTokenizer:
     def _decode(tid:int|None=None) -> str: return dec.decode(self._tok2bytes[tid]) if tid is not None else dec.decode(b'', final=True)
     return _decode
   def role(self, role:str):
-    if self.preset == 'olmo': return self.encode("<|" + role + "|>\n")  # OLMoE Instruct format
+    if self.preset == 'olmo': return self.encode("<|" + role + "|>\n")
     if self.preset == 'kimi-k2': return self.encode("<|im_" + role + "|>" + role + "<|im_middle|>")
     if self.preset == 'qwen2': return self.encode("<|im_start|>" + role + "\n")
     if self.preset == 'glm4': return self.encode("<|" + role + "|>")
@@ -70,6 +70,36 @@ class SimpleTokenizer:
       if role == 'assistant': return []
       raise ValueError(f"Unsupported role '{role}' for tokenizer preset '{self.preset}'")
     return self.encode("<|start_header_id|>" + role + "<|end_header_id|>\n\n")
+
+  def tools(self, tools:list|None) -> list[int]:
+    if not tools: return []
+    if self.preset == 'qwen2':
+      tool_text = "\n# Tools\n\nYou may call one or more functions to assist with the user query.\n"
+      tool_text += "You are provided with function descriptions in <tools></tools> XML tags:\n<tools>\n"
+      for t in tools:
+        f = t.get("function", {})
+        tool_text += f'<tool_description>\n<tool_name>{f.get("name", "")}</tool_name>\n<tool_description>{f.get("description", "")}</tool_description>\n'
+        if params := f.get("parameters"):
+          tool_text += f'<tool_parameters>{json.dumps(params)}</tool_parameters>\n'
+        tool_text += '</tool_description>\n'
+      tool_text += "</tools>\n"
+      return self.encode(tool_text)
+    if self.preset in ('llama3', 'llama-v3', 'llama-bpe'):
+      tool_text = "\n\nCutting Knowledge Date: December 2023\nToday Date: " + time.strftime("%d %b %Y") + "\n\n"
+      tool_text += "# Tool Instructions\n- Call functions using the following format:\n{\"name\": \"function_name\", \"arguments\": {\"arg\": \"value\"}}\n"
+      tool_text += "- For zero-argument functions, use: {\"name\": \"function_name\", \"arguments\": {}}\n\n# Available Tools\n"
+      for t in tools:
+        f = t.get("function", {})
+        tool_text += f'## {f.get("name", "")}\n{f.get("description", "")}\nParameters: {json.dumps(f.get("parameters", {}))}\n\n'
+      return self.encode(tool_text)
+    return []
+
+  def tool_message(self, tool_call_id:str, content:str) -> list[int]:
+    if self.preset == 'qwen2':
+      return self.encode(f"<tool_response>\n{content}\n</tool_response>\n")
+    if self.preset in ('llama3', 'llama-v3', 'llama-bpe'):
+      return self.encode(f"<|start_header_id|>ipython<|end_header_id|>\n\n{content}<|eot_id|>")
+    return self.encode(content)
   def end_turn(self, eos_id:int):
     if self.preset == 'olmo': return self.encode("\n")
     if self.preset == 'kimi-k2': return [eos_id]
@@ -483,6 +513,9 @@ class Transformer:
       tokens.append(int(out.item()))
       self._cached_tokens = tokens[:-1]
       yield tokens[-1]
+      # stop if the generated suffix is a repeating cycle (the model is stuck in a loop)
+      gen_len = len(tokens) - prompt_len
+      if any(gen_len >= 2*c and tokens[-c:] == tokens[-2*c:-c] for c in (10, 20, 40, 80, 160, 320)): return
 
 models = {
   "llama3.2:1b": "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q6_K.gguf",
@@ -545,12 +578,24 @@ CHAT_HTML = b'''<!DOCTYPE html><html><head><title>tinygrad chat</title><style>
   }
 </script></body></html>'''
 
+def parse_tool_calls(text:str) -> list[dict]:
+  calls = []
+  for m in re.finditer(r'\{[^{}]*"name"\s*:\s*"([^"]+)"[^{}]*"arguments"\s*:\s*(\{[^{}]*\}|\{\})[^{}]*\}', text):
+    try:
+      args = json.loads(m.group(2)) if m.group(2) != '{}' else {}
+      calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function", "function": {"name": m.group(1), "arguments": json.dumps(args)}})
+    except json.JSONDecodeError: pass
+  return calls
+
 class Handler(HTTPRequestHandler):
+  _recent_completions: list[tuple[int, list[int]]] = []  # (ids_hash, out_tokens) rolling history
+  _recent_max = 6
   def log_request(self, code='-', size='-'): pass
   def do_GET(self):
     if self.path == "/v1/models": self.send_data(json.dumps({"object":"list","data":[{"id":model_name,"object":"model"}]}).encode())
     else: self.send_data(CHAT_HTML, content_type="text/html")
-  def run_model(self, ids:list[int], model_name:str, include_usage=False, max_tokens:int|None=None, temperature:float=0.0):
+
+  def run_model(self, ids:list[int], model_name:str, include_usage=False, max_tokens:int|None=None, temperature:float=0.0, tools:list|None=None):
     cache_start_pos = model.get_start_pos(ids)
     stderr_log(f"{self.path}  {colored('--', 'BLACK')}  "
                f"in:{colored(f'{cache_start_pos:5d}', 'green')} +{len(ids)-cache_start_pos:5d}  {colored('--', 'BLACK')}  ")
@@ -560,6 +605,7 @@ class Handler(HTTPRequestHandler):
     finish_reason = "stop"
     st = time.perf_counter()
     dec = tok.stream_decoder()
+    ids_hash, recent = hash(tuple(ids)), list(Handler._recent_completions)
     for next_id in model.generate(ids, temperature=temperature):
       if len(out) == 0: stderr_log(f"prefill:{(len(ids)-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
       if next_id in (eos_id, eot_id): break
@@ -568,7 +614,15 @@ class Handler(HTTPRequestHandler):
       if max_tokens is not None and len(out) >= max_tokens:
         finish_reason = "length"
         break
+      # cross-request loop guard: a recent completion (from a different prompt) is being retraced
+      if len(out) >= 40 and any(h != ids_hash and len(o) >= len(out) and o[:len(out)] == out for h, o in recent):
+        stderr_log(f"{colored('loop detected, stopping', 'yellow')}  {colored('--', 'BLACK')}  ")
+        break
+    Handler._recent_completions = (Handler._recent_completions + [(ids_hash, out)])[-Handler._recent_max:]
     if (tail := dec()): yield {"choices": [{"index":0, "delta":{"content":tail}, "finish_reason":None}], **tmpl}
+    if tools and (calls := parse_tool_calls(tok.decode(out))):
+      yield {"choices": [{"index":0, "delta":{"tool_calls":calls}, "finish_reason":None}], **tmpl}
+      finish_reason = "tool_calls"
     yield {"choices": [{"index":0, "delta":{},"finish_reason":finish_reason}], **tmpl}
     if include_usage:
       yield {"choices": [], "usage": {"prompt_tokens": len(ids), "completion_tokens": len(out), "total_tokens": len(ids) + len(out)}, **tmpl}
@@ -581,33 +635,51 @@ class Handler(HTTPRequestHandler):
     body: dict[str, typing.Any] = json.loads(raw_body.decode("utf-8"))
     if DEBUG >= 1: print(json.dumps(body, indent=2))
     if self.path == "/v1/chat/completions":
-      # extract tokens, last assistant message is treated as prefill
-      ids: list[int] = tok.prefix(bos_id)
+      tools = body.get("tools")
+      ids: list[int] = tok.prefix(bos_id) + tok.tools(tools)
       for i, msg in enumerate(body["messages"]):
-        ids += tok.role(msg["role"])
-        content = msg["content"]
+        role = msg["role"]
+        if role == "tool":
+          ids += tok.role("tool") + tok.tool_message(msg.get("tool_call_id", ""), msg.get("content", ""))
+          continue
+        ids += tok.role(role)
+        content = msg.get("content") or ""
         if isinstance(content, str): ids += tok.encode(content)
         elif isinstance(content, list):
           for c in content:
             if c["type"] == "text": ids += tok.encode(c["text"])
             else: raise RuntimeError(f"unhandled type: {c['type']}")
         else: raise RuntimeError(f"unknown content type: {type(content)}")
-        if msg["role"] == "assistant" and i == len(body["messages"]) - 1: break
+        if tool_calls := msg.get("tool_calls"):
+          for tc in tool_calls:
+            fn = tc.get("function", {})
+            ids += tok.encode(f'\n{json.dumps({"name": fn.get("name"), "arguments": fn.get("arguments")})}')
+        if role == "assistant" and i == len(body["messages"]) - 1: break
         ids += tok.end_turn(eos_id)
-      else: ids += tok.role("assistant")
+      else:
+        ids += tok.role("assistant")
+        # Qwen3 emits a long <think>...</think> block by default; pre-fill an empty one to skip reasoning
+        if tok.preset == "qwen2" and "<think>" in tok._special_tokens: ids += tok.encode("<think>\n\n</think>\n\n")
 
-      # reply
+      # simple truncation for safety
+      if len(ids) > model.max_context:
+        stderr_log(f"truncating {len(ids)} tokens to {model.max_context}\n")
+        ids = ids[-model.max_context:]
+
       max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
-                              max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)))
+                              max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)), tools=tools)
       if body.get("stream"): self.stream_json(chunks)
       else:
-        out, finish_reason = [], "stop"
+        out, finish_reason, tool_calls_out = [], "stop", []
         for c in chunks:
           if c["choices"] and c["choices"][0].get("delta", {}).get("content"): out.append(c["choices"][0]["delta"]["content"])
+          if c["choices"] and c["choices"][0].get("delta", {}).get("tool_calls"): tool_calls_out.extend(c["choices"][0]["delta"]["tool_calls"])
           if c["choices"] and c["choices"][0].get("finish_reason"): finish_reason = c["choices"][0]["finish_reason"]
+        msg = {"role": "assistant", "content": "".join(out) or None}
+        if tool_calls_out: msg["tool_calls"] = tool_calls_out
         self.send_data(json.dumps({**c, "object":"chat.completion",
-          "choices":[{"index":0, "message":{"role":"assistant","content":"".join(out)}, "finish_reason":finish_reason}]}).encode())
+          "choices":[{"index":0, "message":msg, "finish_reason":finish_reason}]}).encode())
     else:
       raise RuntimeError(f"unhandled path {self.path}")
 
@@ -638,9 +710,9 @@ if __name__ == "__main__":
 
   # warmup the JIT
   if args.warmup or args.serve:
-    # run 2 tokens through the model twice to capture the JIT before serving
+    # vary the prompt so cache doesn't short-circuit prefill; captures both prefill (T>1) and rollout (T=1) paths
     with Context(DEBUG=max(DEBUG.value, 1)):
-      for _ in range(2): list(zip(range(2), model.generate([0])))
+      for i in range(3): list(zip(range(2), model.generate([i+1] * 32)))
 
   # start server
   if args.serve: TCPServerWithReuse(('', args.serve), Handler).serve_forever()
