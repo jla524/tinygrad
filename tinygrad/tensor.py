@@ -1841,7 +1841,6 @@ class Tensor(OpMixin):
     print(topk_indices.numpy())
     ```
     """
-    if not sorted_: raise NotImplementedError("topk with sorted_=False is not supported")
     if k > self.shape[dim:=self._resolve_dim(dim)]: raise ValueError(f"selected index {k=} is out of range")
     x, idx = self.sort(dim, descending=largest)
     topk_shape = tuple(k if i == dim else None for i in range(self.ndim))

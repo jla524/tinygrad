@@ -1245,17 +1245,32 @@ class TestOps(unittest.TestCase):
                                   lambda x: x.argsort(dim, descending), forward_only=True)
 
   def test_topk(self):
+    def canon_torch_vals(x, k, dim, largest):
+      vals = x.topk(k, dim, largest, False).values
+      return vals.gather(dim, vals.argsort(dim=dim, descending=largest, stable=True))
+    def canon_torch_idxs(x, k, dim, largest):
+      topk = x.topk(k, dim, largest, False)
+      return topk.indices.gather(dim, topk.values.argsort(dim=dim, descending=largest, stable=True)).type(torch.int32)
+    def canon_tiny_vals(x, k, dim, largest):
+      vals = x.topk(k, dim, largest, False)[0]
+      return vals.gather(dim, vals.argsort(dim, descending=largest))
+    def canon_tiny_idxs(x, k, dim, largest):
+      vals, idxs = x.topk(k, dim, largest, False)
+      return idxs.gather(dim, vals.argsort(dim, descending=largest))
+
     helper_test_op([(8)], lambda x: x.topk(3).values, lambda x: x.topk(3)[0], forward_only=True)
     helper_test_op([(8)], lambda x: x.topk(3).indices.type(torch.int32), lambda x: x.topk(3)[1], forward_only=True)
     for dim in [0, 1, -1]:
       for largest in [True, False]:
-        for sorted_ in [True]: # TODO support False
+        for sorted_ in [True]:
           helper_test_op([(5,5,4)],
                           lambda x: x.topk(4, dim, largest, sorted_).values,
                           lambda x: x.topk(4, dim, largest, sorted_)[0], forward_only=True)
           helper_test_op([(5,5,4)],
                           lambda x: x.topk(4, dim, largest, sorted_).indices.type(torch.int32),
                           lambda x: x.topk(4, dim, largest, sorted_)[1], forward_only=True)
+        helper_test_op([(5,5,4)], lambda x: canon_torch_vals(x, 4, dim, largest), lambda x: canon_tiny_vals(x, 4, dim, largest), forward_only=True)
+        helper_test_op([(5,5,4)], lambda x: canon_torch_idxs(x, 4, dim, largest), lambda x: canon_tiny_idxs(x, 4, dim, largest), forward_only=True)
     # repeated values
     if not COMPILE_ONLY:
       value, indices = Tensor([1, 1, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0]).topk(3)
