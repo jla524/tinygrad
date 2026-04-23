@@ -932,10 +932,15 @@ class Tensor(OpMixin):
   def _rop(self, op:Ops, axis:tuple[int, ...]) -> Tensor: return self._apply_uop(UOp._rop, op=op, axis=axis)
 
   def _pad_circular(self, pX:tuple[tuple[sint, sint], ...]) -> Tensor:
-    if any(pB>sh or pA>sh for (pB,pA),sh in zip(pX, self.shape)): raise ValueError('Padding value causes wrapping around more than once.')
-    if any(pB<0 or pA<0 for pB,pA in pX): raise NotImplementedError("Negative pads with circular pads is not supported")
-    orig_shape, X = self.shape, self.repeat(tuple(1 + bool(pB) + bool(pA) for pB,pA in pX))
-    return X.shrink(tuple((0 if pB == 0 else osh-pB, xsh if pA == 0 else xsh-osh+pA) for (pB,pA),osh,xsh in zip(pX, orig_shape, X.shape)))
+    if any(max(pB, 0) > sh or max(pA, 0) > sh for (pB,pA),sh in zip(pX, self.shape)):
+      raise ValueError('Padding value causes wrapping around more than once.')
+    X = self.shrink(tuple((-min(pB, 0), min(pA+sh, sh)) for (pB,pA),sh in zip(pX, self.shape)))
+    pads = tuple((max(pB, 0), max(pA, 0)) for pB,pA in pX)
+    if any((pB or pA) and sh == 0 for (pB, pA), sh in zip(pads, X.shape)) or any(pB > sh or pA > sh for (pB, pA), sh in zip(pads, X.shape)):
+      raise ValueError('Padding value causes wrapping around more than once.')
+    if not any(pB or pA for pB, pA in pads): return X
+    orig_shape, X = X.shape, X.repeat(tuple(1 + bool(pB) + bool(pA) for pB,pA in pads))
+    return X.shrink(tuple((0 if pB == 0 else osh-pB, xsh if pA == 0 else xsh-osh+pA) for (pB,pA),osh,xsh in zip(pads, orig_shape, X.shape)))
 
   def _pad_reflect_replicate(self, pX:tuple[tuple[sint, sint], ...], mode:str) -> Tensor:
     X, pads = self, tuple((smax(pB,0), smax(pA,0)) for pB,pA in pX)
